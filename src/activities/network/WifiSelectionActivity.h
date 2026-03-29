@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -9,10 +10,14 @@
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
+struct arduino_event_t;
+
 // Structure to hold WiFi network information
 struct WifiNetworkInfo {
   std::string ssid;
   int32_t rssi;
+  int32_t channel;
+  uint8_t bssid[6];
   bool isEncrypted;
   bool hasSavedPassword;  // Whether we have saved credentials for this network
   std::string ipAddress;  // Populated after connection for display
@@ -52,6 +57,9 @@ class WifiSelectionActivity final : public Activity {
   // Selected network for connection
   std::string selectedSSID;
   bool selectedRequiresPassword = false;
+  int32_t selectedChannel = 0;
+  uint8_t selectedBssid[6] = {0};
+  bool selectedHasBssid = false;
 
   // Connection result
   std::string connectedIP;
@@ -79,6 +87,8 @@ class WifiSelectionActivity final : public Activity {
   // Connection timeout
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
   unsigned long connectionStartTime = 0;
+  int lastLoggedConnectStatus = -1;
+  size_t wifiEventHandle = 0;
 
   void renderNetworkList() const;
   void renderPasswordEntry() const;
@@ -94,6 +104,7 @@ class WifiSelectionActivity final : public Activity {
   void attemptConnection();
   void checkConnectionStatus();
   std::string getSignalStrengthIndicator(int32_t rssi) const;
+  static void wifiEventLogger(arduino_event_t* event);
 
   void onComplete(bool connected);
 
