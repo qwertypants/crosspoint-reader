@@ -16,6 +16,10 @@
 void WifiSelectionActivity::onEnter() {
   Activity::onEnter();
 
+  if (wifiEventHandle == 0) {
+    wifiEventHandle = WiFi.onEvent(&WifiSelectionActivity::wifiEventLogger);
+  }
+
   // Load saved WiFi credentials - SD card operations need lock as we use SPI
   // for both
   {
@@ -31,6 +35,9 @@ void WifiSelectionActivity::onEnter() {
   connectedIP.clear();
   connectionError.clear();
   enteredPassword.clear();
+  selectedChannel = 0;
+  memset(selectedBssid, 0, sizeof(selectedBssid));
+  selectedHasBssid = false;
   usedSavedPassword = false;
   savePromptSelection = 0;
   forgetPromptSelection = 0;
@@ -71,6 +78,11 @@ void WifiSelectionActivity::onEnter() {
 }
 
 void WifiSelectionActivity::onExit() {
+  if (wifiEventHandle != 0) {
+    WiFi.removeEvent(wifiEventHandle);
+    wifiEventHandle = 0;
+  }
+
   Activity::onExit();
 
   LOG_DBG("WIFI", "Free heap at onExit start: %d bytes", ESP.getFreeHeap());
@@ -136,6 +148,13 @@ void WifiSelectionActivity::processWifiScanResults() {
       WifiNetworkInfo network;
       network.ssid = ssid;
       network.rssi = rssi;
+      network.channel = WiFi.channel(i);
+      const uint8_t* bssid = WiFi.BSSID(i);
+      if (bssid) {
+        memcpy(network.bssid, bssid, sizeof(network.bssid));
+      } else {
+        memset(network.bssid, 0, sizeof(network.bssid));
+      }
       network.isEncrypted = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
       network.hasSavedPassword = WIFI_STORE.hasSavedCredential(network.ssid);
       uniqueNetworks[ssid] = network;
@@ -171,6 +190,9 @@ void WifiSelectionActivity::selectNetwork(const int index) {
   const auto& network = networks[index];
   selectedSSID = network.ssid;
   selectedRequiresPassword = network.isEncrypted;
+  selectedChannel = network.channel;
+  memcpy(selectedBssid, network.bssid, sizeof(selectedBssid));
+  selectedHasBssid = true;
   usedSavedPassword = false;
   enteredPassword.clear();
   autoConnecting = false;
@@ -213,11 +235,20 @@ void WifiSelectionActivity::selectNetwork(const int index) {
 void WifiSelectionActivity::attemptConnection() {
   state = autoConnecting ? WifiSelectionState::AUTO_CONNECTING : WifiSelectionState::CONNECTING;
   connectionStartTime = millis();
+  lastLoggedConnectStatus = -1;
   connectedIP.clear();
   connectionError.clear();
   requestUpdate();
 
+  // Fully reset WiFi driver/supplicant state before each connection attempt.
+  // This is stronger than disconnect() and helps avoid stale 4-way handshake
+  // context between attempts.
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_MODE_NULL);
+  delay(100);
   WiFi.mode(WIFI_STA);
+  delay(50);
 
   // Set hostname so routers show "CrossPoint-Reader-AABBCCDDEEFF" instead of "esp32-XXXXXXXXXXXX"
   String mac = WiFi.macAddress();
@@ -225,10 +256,25 @@ void WifiSelectionActivity::attemptConnection() {
   String hostname = "CrossPoint-Reader-" + mac;
   WiFi.setHostname(hostname.c_str());
 
+  size_t spaceCount = 0;
+  for (char c : enteredPassword) {
+    if (c == ' ') {
+      spaceCount++;
+    }
+  }
+  const bool leadingSpace = !enteredPassword.empty() && enteredPassword.front() == ' ';
+  const bool trailingSpace = !enteredPassword.empty() && enteredPassword.back() == ' ';
+  LOG_INF("WIFI", "Connecting to %s (password length=%zu spaces=%zu leading=%d trailing=%d ch=%d)", selectedSSID.c_str(),
+          enteredPassword.size(), spaceCount, leadingSpace ? 1 : 0, trailingSpace ? 1 : 0, selectedChannel);
+  LOG_DBG("WIFI", "Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X", selectedBssid[0], selectedBssid[1], selectedBssid[2],
+          selectedBssid[3], selectedBssid[4], selectedBssid[5]);
+  const uint8_t* targetBssid = selectedHasBssid ? selectedBssid : nullptr;
+  const int32_t targetChannel = selectedHasBssid ? selectedChannel : 0;
+
   if (selectedRequiresPassword && !enteredPassword.empty()) {
-    WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str());
+    WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str(), targetChannel, targetBssid);
   } else {
-    WiFi.begin(selectedSSID.c_str());
+    WiFi.begin(selectedSSID.c_str(), nullptr, targetChannel, targetBssid);
   }
 }
 
@@ -238,6 +284,11 @@ void WifiSelectionActivity::checkConnectionStatus() {
   }
 
   const wl_status_t status = WiFi.status();
+  if (lastLoggedConnectStatus != static_cast<int>(status)) {
+    lastLoggedConnectStatus = static_cast<int>(status);
+    const unsigned long elapsedMs = millis() - connectionStartTime;
+    LOG_INF("WIFI", "Connect state=%d elapsed=%lu ms", static_cast<int>(status), elapsedMs);
+  }
 
   if (status == WL_CONNECTED) {
     // Successfully connected
@@ -283,10 +334,32 @@ void WifiSelectionActivity::checkConnectionStatus() {
   // Check for timeout
   if (millis() - connectionStartTime > CONNECTION_TIMEOUT_MS) {
     WiFi.disconnect();
+    LOG_INF("WIFI", "Connection timeout after %lu ms (status=%d)", CONNECTION_TIMEOUT_MS, static_cast<int>(status));
     connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
     state = WifiSelectionState::CONNECTION_FAILED;
     requestUpdate();
     return;
+  }
+}
+
+void WifiSelectionActivity::wifiEventLogger(arduino_event_t* event) {
+  if (!event) {
+    return;
+  }
+
+  if (event->event_id == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    uint8_t reason = event->event_info.wifi_sta_disconnected.reason;
+    if (reason == 0) {
+      reason = WIFI_REASON_UNSPECIFIED;
+    }
+    LOG_INF("WIFI", "STA_DISCONNECTED reason=%u (%s)", reason, WiFi.disconnectReasonName((wifi_err_reason_t)reason));
+  } else if (event->event_id == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    LOG_INF("WIFI", "STA_CONNECTED");
+  } else if (event->event_id == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    IPAddress ip = WiFi.localIP();
+    char ipStr[16];
+    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+    LOG_INF("WIFI", "STA_GOT_IP %s", ipStr);
   }
 }
 
