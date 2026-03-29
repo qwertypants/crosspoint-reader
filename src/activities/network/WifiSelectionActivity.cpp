@@ -13,6 +13,8 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+uint8_t WifiSelectionActivity::latestDisconnectReason = 0;
+
 void WifiSelectionActivity::onEnter() {
   Activity::onEnter();
 
@@ -38,6 +40,9 @@ void WifiSelectionActivity::onEnter() {
   selectedChannel = 0;
   memset(selectedBssid, 0, sizeof(selectedBssid));
   selectedHasBssid = false;
+  preferPinnedAp = true;
+  fallbackNoBssidTried = false;
+  latestDisconnectReason = 0;
   usedSavedPassword = false;
   savePromptSelection = 0;
   forgetPromptSelection = 0;
@@ -193,6 +198,9 @@ void WifiSelectionActivity::selectNetwork(const int index) {
   selectedChannel = network.channel;
   memcpy(selectedBssid, network.bssid, sizeof(selectedBssid));
   selectedHasBssid = true;
+  preferPinnedAp = true;
+  fallbackNoBssidTried = false;
+  latestDisconnectReason = 0;
   usedSavedPassword = false;
   enteredPassword.clear();
   autoConnecting = false;
@@ -236,6 +244,7 @@ void WifiSelectionActivity::attemptConnection() {
   state = autoConnecting ? WifiSelectionState::AUTO_CONNECTING : WifiSelectionState::CONNECTING;
   connectionStartTime = millis();
   lastLoggedConnectStatus = -1;
+  latestDisconnectReason = 0;
   connectedIP.clear();
   connectionError.clear();
   requestUpdate();
@@ -264,12 +273,14 @@ void WifiSelectionActivity::attemptConnection() {
   }
   const bool leadingSpace = !enteredPassword.empty() && enteredPassword.front() == ' ';
   const bool trailingSpace = !enteredPassword.empty() && enteredPassword.back() == ' ';
-  LOG_INF("WIFI", "Connecting to %s (password length=%zu spaces=%zu leading=%d trailing=%d ch=%d)", selectedSSID.c_str(),
-          enteredPassword.size(), spaceCount, leadingSpace ? 1 : 0, trailingSpace ? 1 : 0, selectedChannel);
+  LOG_INF("WIFI", "Connecting to %s (password length=%zu spaces=%zu leading=%d trailing=%d ch=%d pinned=%d)",
+          selectedSSID.c_str(), enteredPassword.size(), spaceCount, leadingSpace ? 1 : 0, trailingSpace ? 1 : 0,
+          selectedChannel, preferPinnedAp ? 1 : 0);
   LOG_DBG("WIFI", "Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X", selectedBssid[0], selectedBssid[1], selectedBssid[2],
           selectedBssid[3], selectedBssid[4], selectedBssid[5]);
-  const uint8_t* targetBssid = selectedHasBssid ? selectedBssid : nullptr;
-  const int32_t targetChannel = selectedHasBssid ? selectedChannel : 0;
+  const bool usePinnedTarget = selectedHasBssid && preferPinnedAp;
+  const uint8_t* targetBssid = usePinnedTarget ? selectedBssid : nullptr;
+  const int32_t targetChannel = usePinnedTarget ? selectedChannel : 0;
 
   if (selectedRequiresPassword && !enteredPassword.empty()) {
     WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str(), targetChannel, targetBssid);
@@ -288,6 +299,17 @@ void WifiSelectionActivity::checkConnectionStatus() {
     lastLoggedConnectStatus = static_cast<int>(status);
     const unsigned long elapsedMs = millis() - connectionStartTime;
     LOG_INF("WIFI", "Connect state=%d elapsed=%lu ms", static_cast<int>(status), elapsedMs);
+  }
+
+  const bool isHandshakeTimeout = latestDisconnectReason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+                                  latestDisconnectReason == WIFI_REASON_HANDSHAKE_TIMEOUT;
+  if (isHandshakeTimeout && selectedHasBssid && preferPinnedAp && !fallbackNoBssidTried) {
+    LOG_INF("WIFI", "Handshake timeout while pinned to BSSID, retrying unpinned connect");
+    fallbackNoBssidTried = true;
+    preferPinnedAp = false;
+    latestDisconnectReason = 0;
+    attemptConnection();
+    return;
   }
 
   if (status == WL_CONNECTED) {
@@ -352,10 +374,13 @@ void WifiSelectionActivity::wifiEventLogger(arduino_event_t* event) {
     if (reason == 0) {
       reason = WIFI_REASON_UNSPECIFIED;
     }
+    latestDisconnectReason = reason;
     LOG_INF("WIFI", "STA_DISCONNECTED reason=%u (%s)", reason, WiFi.disconnectReasonName((wifi_err_reason_t)reason));
   } else if (event->event_id == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+    latestDisconnectReason = 0;
     LOG_INF("WIFI", "STA_CONNECTED");
   } else if (event->event_id == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    latestDisconnectReason = 0;
     IPAddress ip = WiFi.localIP();
     char ipStr[16];
     snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);

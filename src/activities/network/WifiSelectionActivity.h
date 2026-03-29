@@ -60,6 +60,8 @@ class WifiSelectionActivity final : public Activity {
   int32_t selectedChannel = 0;
   uint8_t selectedBssid[6] = {0};
   bool selectedHasBssid = false;
+  bool preferPinnedAp = true;
+  bool fallbackNoBssidTried = false;
 
   // Connection result
   std::string connectedIP;
@@ -89,6 +91,7 @@ class WifiSelectionActivity final : public Activity {
   unsigned long connectionStartTime = 0;
   int lastLoggedConnectStatus = -1;
   size_t wifiEventHandle = 0;
+  static uint8_t latestDisconnectReason;
 
   void renderNetworkList() const;
   void renderPasswordEntry() const;
